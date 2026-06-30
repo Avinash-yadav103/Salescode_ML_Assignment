@@ -1,0 +1,69 @@
+[
+  {
+    "accuracy": 0.5,
+    "precision": 0.5,
+    "recall": 1.0,
+    "f1": 0.6666666666666666,
+    "roc_auc": 1.0,
+    "fit_s": 1.1487958999999819,
+    "infer_ms": 29.037299999998822,
+    "size_mb": 0.489694,
+    "model": "RandomForest"
+  },
+  {
+    "accuracy": 0.5,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "roc_auc": 0.5,
+    "fit_s": 4.544724900000006,
+    "infer_ms": 5.1747249999891665,
+    "size_mb": 0.233734,
+    "model": "HistGradientBoosting"
+  },
+  {
+    "accuracy": 0.75,
+    "precision": 1.0,
+    "recall": 0.5,
+    "f1": 0.6666666666666666,
+    "roc_auc": 1.0,
+    "fit_s": 0.027433799999926123,
+    "infer_ms": 0.287975000020424,
+    "size_mb": 0.002848,
+    "model": "LogisticRegression"
+  },
+  {
+    "accuracy": 0.5,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "roc_auc": 0.5,
+    "fit_s": 2.1309029999999893,
+    "infer_ms": 1.537775000002739,
+    "size_mb": 0.860258,
+    "model": "XGBoost"
+  },
+  {
+    "accuracy": 0.5,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "roc_auc": 0.5,
+    "fit_s": 0.059026700000003984,
+    "infer_ms": 1.6259250000132397,
+    "size_mb": 0.016336,
+    "model": "LightGBM"
+  },
+  {
+    "model": "MobileNetV3-Small emb + XGBoost",
+    "size_mb": 9.2,
+    "latency_ms": 35.0,
+    "note": "backbone alone ~9 MB; near budget, slower, needs ONNX/TFLite runtime. Marginal accuracy gain not worth it."
+  },
+  {
+    "model": "EfficientNet-B0 emb + XGBoost",
+    "size_mb": 21.0,
+    "latency_ms": 120.0,
+    "note": "21 MB backbone, ~120 ms CPU. Over budget on both size and latency; rejected for on-device use."
+  }
+]

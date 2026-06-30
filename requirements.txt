@@ -1,0 +1,16 @@
+# --- Core (required for predict.py / train.py / evaluate.py) ---------------
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+scikit-learn>=1.3
+joblib>=1.3
+pillow>=9.5
+
+# --- Training extras (model comparison + plots) ----------------------------
+matplotlib>=3.7
+xgboost>=2.0        # optional: skipped automatically if not installed
+lightgbm>=4.0       # optional: skipped automatically if not installed
+
+# --- Optional demos --------------------------------------------------------
+streamlit>=1.30     # for streamlit_app.py
+flask>=3.0          # for app.py
