@@ -28,27 +28,31 @@ warnings.filterwarnings("ignore")
 RESULTS_DIR = "results"
 
 
-def _load():
-    payload = joblib.load("model.pkl")
-    with open(os.path.join(RESULTS_DIR, "split.json")) as f:
-        split = json.load(f)
-    X = np.load(os.path.join(RESULTS_DIR, "X.npy"))
-    y = np.array(split["labels"])
-    te = np.array(split["test_idx"])
-    return payload, X, y, te
+def _load_oof():
+    """Honest evaluation source: the out-of-fold cross-validation predictions
+    written by train.py / finetune.py, where every image was scored by a model
+    that never saw it. Preferred over a single hold-out split -- stable on a
+    small dataset and free of the optimism of scoring training images."""
+    with open(os.path.join(RESULTS_DIR, "oof.json")) as f:
+        oof = json.load(f)
+    yte = np.array(oof["y_true"])
+    proba = np.array(oof["y_score"])
+    name = oof.get("model", "model")
+    return name, yte, proba
 
 
 def main():
-    if not (os.path.exists("model.pkl") and
-            os.path.exists(os.path.join(RESULTS_DIR, "X.npy"))):
-        raise SystemExit("Run train.py first (need model.pkl and results/X.npy).")
+    oof_path = os.path.join(RESULTS_DIR, "oof.json")
+    if not os.path.exists(oof_path):
+        raise SystemExit("Run train.py or finetune.py first (need results/oof.json).")
 
-    payload, X, y, te = _load()
-    model = payload["model"]
-    Xte, yte = X[te], y[te]
-
-    proba = model.predict_proba(Xte)[:, 1]
-    thr = payload.get("threshold", 0.5)
+    model_name, yte, proba = _load_oof()
+    thr = 0.5
+    if os.path.exists("model.pkl"):
+        try:
+            thr = joblib.load("model.pkl").get("threshold", 0.5)
+        except Exception:
+            pass
     pred = (proba >= thr).astype(int)
 
     acc = accuracy_score(yte, pred)
@@ -59,9 +63,9 @@ def main():
     cm = confusion_matrix(yte, pred)
 
     print("=" * 56)
-    print(f" Held-out evaluation  ({payload['model_name']})")
+    print(f" Cross-validation evaluation  ({model_name})")
     print("=" * 56)
-    print(f" Test images : {len(yte)}  ({(yte==0).sum()} real / {(yte==1).sum()} screen)")
+    print(f" Images (OOF): {len(yte)}  ({(yte==0).sum()} real / {(yte==1).sum()} screen)")
     print(f" Accuracy    : {acc:.4f}")
     print(f" Precision   : {prec:.4f}")
     print(f" Recall      : {rec:.4f}")

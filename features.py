@@ -73,7 +73,18 @@ def load_image(path_or_array) -> np.ndarray:
     if isinstance(path_or_array, np.ndarray):
         img = Image.fromarray(path_or_array).convert("RGB")
     else:
-        img = Image.open(path_or_array).convert("RGB")
+        img = Image.open(path_or_array)
+        # Fast path: for JPEGs, `draft` lets libjpeg decode at a reduced DCT
+        # scale (1/2, 1/4, 1/8) *during* decode instead of unpacking the full
+        # frame and shrinking afterwards. On full-resolution phone photos this
+        # is the single biggest latency win (decode dominates end-to-end time).
+        # We aim ~2x above WORK_SIZE so the downstream BILINEAR resize still has
+        # headroom and the moire/grid mid-frequencies we rely on are preserved.
+        try:
+            img.draft("RGB", (WORK_SIZE * 2, WORK_SIZE * 2))
+        except Exception:
+            pass
+        img = img.convert("RGB")
 
     w, h = img.size
     scale = WORK_SIZE / min(w, h)

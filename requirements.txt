@@ -6,10 +6,14 @@ scikit-learn>=1.3
 joblib>=1.3
 pillow>=9.5
 
-# --- Training extras (model comparison + plots) ----------------------------
+# --- CNN backbone (shipped model = ConvNeXt-Tiny embedding + logistic head) -
+# CPU-only wheels are fine; install with:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+torchvision>=0.15
+
+# --- Plots (evaluate.py) ---------------------------------------------------
 matplotlib>=3.7
-xgboost>=2.0        # optional: skipped automatically if not installed
-lightgbm>=4.0       # optional: skipped automatically if not installed
 
 # --- Optional demos --------------------------------------------------------
 streamlit>=1.30     # for streamlit_app.py

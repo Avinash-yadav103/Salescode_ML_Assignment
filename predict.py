@@ -49,8 +49,29 @@ def _heuristic_score(feat: dict) -> float:
 # --------------------------------------------------------------------------- #
 # Main predictor
 # --------------------------------------------------------------------------- #
-def predict(image_path: str) -> float:
+def _build_vector(payload, image_path):
+    """Reconstruct the exact representation the shipped model was trained on:
+    hand-crafted features, a CNN embedding, or both concatenated (hand first)."""
     from features import extract_features, FEATURE_NAMES, _feature_dict
+    import numpy as np
+
+    parts = []
+    if payload.get("use_hand", True):
+        names = payload.get("feature_names", FEATURE_NAMES)
+        d = _feature_dict(image_path)
+        parts.append(np.array([d.get(n, 0.0) for n in names], dtype=np.float32))
+    backbone = payload.get("backbone")
+    if backbone:
+        from embeddings import embed_image
+        emb = embed_image(image_path, backbone=backbone,
+                          input_size=payload.get("input_size"))
+        parts.append(emb.astype(np.float32))
+    x = np.concatenate(parts).reshape(1, -1)
+    return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def predict(image_path: str) -> float:
+    from features import _feature_dict
     import numpy as np
 
     # Trained-model path.
@@ -59,16 +80,13 @@ def predict(image_path: str) -> float:
             import joblib
             payload = joblib.load(MODEL_PATH)
             model = payload["model"]
-            names = payload.get("feature_names", FEATURE_NAMES)
-            d = _feature_dict(image_path)
-            x = np.array([[d.get(n, 0.0) for n in names]], dtype=np.float32)
-            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            x = _build_vector(payload, image_path)
             return float(model.predict_proba(x)[0, 1])
         except Exception as e:                       # never fail the interface
             print(f"[predict] model path failed ({e}); using heuristic",
                   file=sys.stderr)
 
-    # Heuristic fallback.
+    # Heuristic fallback (needs no model, no torch).
     return float(_heuristic_score(_feature_dict(image_path)))
 
 

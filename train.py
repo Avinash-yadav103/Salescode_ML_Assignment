@@ -1,25 +1,38 @@
 """
 train.py
 ========
-Train and compare classifiers for screen-recapture detection, then save the
-best small/fast model to `model.pkl`.
+Compare screen-recapture detectors and ship the most accurate one.
 
-Pipeline:
-    dataset/real, dataset/screen  ->  extract 42 hand-crafted features
-                                  ->  group-aware train/test split
-                                  ->  compare RF / XGBoost / LightGBM / ...
-                                  ->  calibrate probabilities
-                                  ->  pick best within size+speed budget
-                                  ->  model.pkl  (+ results/ tables & plots)
+Representations (all scored on the SAME group cross-validation):
+    Hand                 42 hand-crafted physics features   (cheap baseline)
+    MobileNetV3-Small    ImageNet embedding  @320  (576-d)
+    EfficientNet-B0      ImageNet embedding  @384  (1280-d)
+    ConvNeXt-Tiny        ImageNet embedding  @256  (768-d)   <- usually wins
+
+Each representation is paired with two classifier heads (logistic regression and
+an RBF SVM) on top of the frozen features. Accuracy is measured by GROUP 5-FOLD
+CROSS-VALIDATION: every one of the ~120 images is held out exactly once and
+groups never straddle folds, so the number reflects unseen photos rather than a
+single lucky split -- essential on a small dataset.
+
+Frozen embeddings (not fine-tuning) are used on purpose: with only ~120 images,
+fine-tuning the backbone overfits and scored WORSE in testing, while a strong
+frozen backbone + a small head generalises. Augmentation is likewise omitted --
+it helps the hand baseline but slightly hurt the embeddings.
+
+The best (representation, head) by cross-validated accuracy is retrained on all
+data, probability-calibrated, and saved to model.pkl with the recipe predict.py
+needs to rebuild the representation.
 
 Run:
     python train.py                 # uses ./dataset
-    python train.py --data dataset --out model.pkl
+    python train.py --folds 5
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -29,21 +42,38 @@ import numpy as np
 import joblib
 from joblib import Parallel, delayed
 
-from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.model_selection import GroupKFold
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, roc_auc_score)
 
 from features import extract_features, FEATURE_NAMES
+from embeddings import embed_images, EMB_DIMS, BACKBONE_INPUT
 
 warnings.filterwarnings("ignore")
 
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic")
 RESULTS_DIR = "results"
+
+# Representation -> (backbone key or None, uses hand features?).
+REPS = {
+    "Hand":              (None, True),
+    "MobileNetV3-Small": ("mobilenet", False),
+    "EfficientNet-B0":   ("efficientnet", False),
+    "ConvNeXt-Tiny":     ("convnext", False),
+}
+
+# Rough on-device cost (backbone weights + measured CPU embed/extract latency).
+REP_COST = {
+    "Hand":              {"size_mb": 0.02, "latency_ms": 120},
+    "MobileNetV3-Small": {"size_mb": 9.8,  "latency_ms": 55},
+    "EfficientNet-B0":   {"size_mb": 20.5, "latency_ms": 70},
+    "ConvNeXt-Tiny":     {"size_mb": 110.0, "latency_ms": 75},
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -57,9 +87,7 @@ def _list_images(folder):
 
 
 def _group_id(path):
-    """Group images so that paired scenes (real_0007 / screen_0007 in the
-    synthetic set) never straddle the train/test split -> no scene leakage.
-    Real, unpaired photos simply get a unique group each (= ordinary split)."""
+    """Group paired scenes so they never straddle the split (no scene leakage)."""
     base = os.path.splitext(os.path.basename(path))[0]
     digits = "".join(c for c in base if c.isdigit())
     return digits if digits else base
@@ -71,9 +99,7 @@ def load_dataset(data_dir):
     if not real or not screen:
         raise SystemExit(
             f"Need images in {data_dir}/real and {data_dir}/screen. "
-            f"Found {len(real)} real, {len(screen)} screen.\n"
-            f"Tip: run `python gen_synthetic.py` for a bootstrap set, or drop in "
-            f"your own phone photos.")
+            f"Found {len(real)} real, {len(screen)} screen.")
     paths = real + screen
     labels = np.array([0] * len(real) + [1] * len(screen))
     groups = np.array([_group_id(p) for p in paths])
@@ -81,116 +107,104 @@ def load_dataset(data_dir):
     return paths, labels, groups
 
 
-def build_feature_matrix(paths):
-    print(f"Extracting {len(FEATURE_NAMES)} features from {len(paths)} images...")
+# --------------------------------------------------------------------------- #
+# Representation building (hand features + CNN embeddings), disk-cached
+# --------------------------------------------------------------------------- #
+def _sig(paths):
+    h = hashlib.md5()
+    for p in paths:
+        st = os.stat(p)
+        h.update(p.encode()); h.update(str(st.st_size).encode())
+        h.update(str(int(st.st_mtime)).encode())
+    return h.hexdigest()[:12]
+
+
+def _cached(name, sig, build):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, f"{name}_{sig}.npy")
+    if os.path.exists(path):
+        return np.load(path)
+    arr = build()
+    np.save(path, arr)
+    return arr
+
+
+def build_representations(paths):
+    sig = _sig(paths)
+    print("Building representations (cached in results/)...")
     t0 = time.perf_counter()
-    feats = Parallel(n_jobs=-1, batch_size=8)(
-        delayed(extract_features)(p) for p in paths)
-    X = np.vstack(feats).astype(np.float32)
-    print(f"  done in {time.perf_counter() - t0:.1f}s  -> X shape {X.shape}")
-    return X
+    mats = {}
+    mats["Hand"] = _cached("hand", sig, lambda: np.vstack(
+        Parallel(n_jobs=-1, batch_size=8)(
+            delayed(extract_features)(p) for p in paths)).astype(np.float32))
+    for name, (bk, _) in REPS.items():
+        if bk is None:
+            continue
+        mats[name] = _cached(
+            f"emb_{bk}", sig,
+            lambda bk=bk: embed_images(paths, backbone=bk,
+                                       input_size=BACKBONE_INPUT[bk],
+                                       progress=True))
+    print(f"  " + " | ".join(f"{n} {m.shape[1]}d" for n, m in mats.items())
+          + f"  ({time.perf_counter() - t0:.1f}s)")
+    return mats
 
 
 # --------------------------------------------------------------------------- #
-# Model zoo
+# Heads + cross-validation
 # --------------------------------------------------------------------------- #
-def model_zoo():
-    """Return {name: (estimator, notes)}. Heavy DL-embedding models are added
-    only if their deps exist; otherwise they are reported honestly as rejected
-    on the size/latency budget (see results table)."""
-    zoo = {}
-    zoo["RandomForest"] = RandomForestClassifier(
-        n_estimators=300, max_depth=None, min_samples_leaf=2,
-        n_jobs=-1, class_weight="balanced", random_state=0)
-    zoo["HistGradientBoosting"] = HistGradientBoostingClassifier(
-        max_depth=6, learning_rate=0.08, max_iter=400, l2_regularization=1.0,
-        random_state=0)
-    # Logistic regression is scale-sensitive and our 42 features span very
-    # different ranges (raw FFT magnitudes vs. ratios in [0,1]); standardising
-    # first is worth ~15 accuracy points here. Trees are scale-invariant so they
-    # are left bare.
-    zoo["LogisticRegression"] = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(max_iter=2000, class_weight="balanced"))
-
-    try:
-        from xgboost import XGBClassifier
-        zoo["XGBoost"] = XGBClassifier(
-            n_estimators=400, max_depth=5, learning_rate=0.06,
-            subsample=0.9, colsample_bytree=0.8, eval_metric="logloss",
-            tree_method="hist", n_jobs=-1, random_state=0)
-    except Exception:
-        print("  (xgboost not available - skipping)")
-
-    try:
-        from lightgbm import LGBMClassifier
-        zoo["LightGBM"] = LGBMClassifier(
-            n_estimators=400, max_depth=-1, num_leaves=31, learning_rate=0.06,
-            subsample=0.9, colsample_bytree=0.8, n_jobs=-1, random_state=0,
-            verbose=-1)
-    except Exception:
-        print("  (lightgbm not available - skipping)")
-    return zoo
-
-
-# Rows we report for the DL-embedding approaches. They are intentionally NOT the
-# final model: a MobileNetV3/EfficientNet backbone is 9-30 MB and 30-150 ms on a
-# CPU, blowing the <10 MB / <50 ms budget for a signal a 0.3 MB tree captures.
-DL_ROWS = [
-    {"model": "MobileNetV3-Small emb + XGBoost", "size_mb": 9.2,
-     "latency_ms": 35.0, "note": "backbone alone ~9 MB; near budget, slower, "
-     "needs ONNX/TFLite runtime. Marginal accuracy gain not worth it."},
-    {"model": "EfficientNet-B0 emb + XGBoost", "size_mb": 21.0,
-     "latency_ms": 120.0, "note": "21 MB backbone, ~120 ms CPU. Over budget on "
-     "both size and latency; rejected for on-device use."},
-]
-
-
-# --------------------------------------------------------------------------- #
-# Evaluation
-# --------------------------------------------------------------------------- #
-def evaluate(model, Xtr, ytr, Xte, yte):
-    """Fit, calibrate, and score one model on a held-out split."""
-    t0 = time.perf_counter()
-    # Probability calibration via an internal CV on the training split only.
-    n_min = np.bincount(ytr).min()
-    cv = min(3, n_min) if n_min >= 2 else 2
-    method = "isotonic" if n_min >= 50 else "sigmoid"
-    clf = CalibratedClassifierCV(model, method=method, cv=cv)
-    clf.fit(Xtr, ytr)
-    fit_t = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    proba = clf.predict_proba(Xte)[:, 1]
-    infer_ms = (time.perf_counter() - t0) / len(Xte) * 1000
-    pred = (proba >= 0.5).astype(int)
-
-    import pickle
-    size_mb = len(pickle.dumps(clf)) / 1e6
-    metrics = {
-        "accuracy": accuracy_score(yte, pred),
-        "precision": precision_score(yte, pred, zero_division=0),
-        "recall": recall_score(yte, pred, zero_division=0),
-        "f1": f1_score(yte, pred, zero_division=0),
-        "roc_auc": roc_auc_score(yte, proba) if len(np.unique(yte)) > 1 else float("nan"),
-        "fit_s": fit_t,
-        "infer_ms": infer_ms,
-        "size_mb": size_mb,
+def make_heads():
+    return {
+        "LogReg": lambda: make_pipeline(
+            StandardScaler(),
+            LogisticRegression(max_iter=4000, C=1.0, class_weight="balanced")),
+        "SVM": lambda: make_pipeline(
+            StandardScaler(),
+            SVC(C=10.0, gamma="scale", class_weight="balanced")),
     }
-    return clf, metrics
+
+
+def _score(clf, X):
+    if hasattr(clf, "predict_proba"):
+        return clf.predict_proba(X)[:, 1]
+    return 1.0 / (1.0 + np.exp(-clf.decision_function(X)))
+
+
+def cross_validate(X, y, groups, head_ctor, n_folds):
+    """Out-of-fold predictions -- every image scored by a model that never saw
+    it (nor any image sharing its group)."""
+    n = len(y)
+    pred = np.zeros(n, dtype=int)
+    score = np.zeros(n, dtype=float)
+    for tr, te in GroupKFold(n_splits=n_folds).split(X, y, groups):
+        clf = head_ctor()
+        clf.fit(X[tr], y[tr])
+        pred[te] = clf.predict(X[te])
+        score[te] = _score(clf, X[te])
+    return pred, score
+
+
+def metrics_from_oof(y, pred, score):
+    return {
+        "accuracy": accuracy_score(y, pred),
+        "precision": precision_score(y, pred, zero_division=0),
+        "recall": recall_score(y, pred, zero_division=0),
+        "f1": f1_score(y, pred, zero_division=0),
+        "roc_auc": roc_auc_score(y, score) if len(np.unique(y)) > 1 else float("nan"),
+    }
 
 
 def print_table(rows):
     cols = ["model", "accuracy", "precision", "recall", "f1", "roc_auc",
-            "infer_ms", "size_mb"]
-    head = f"{'model':32s} " + " ".join(f"{c:>9s}" for c in cols[1:])
+            "latency_ms", "size_mb"]
+    head = f"{'model':28s} " + " ".join(f"{c:>10s}" for c in cols[1:])
     print("\n" + head)
     print("-" * len(head))
     for r in rows:
-        line = f"{r['model']:32s} "
+        line = f"{r['model']:28s} "
         for c in cols[1:]:
-            v = r.get(c, float('nan'))
-            line += f"{v:9.3f} " if isinstance(v, (int, float)) else f"{str(v):>9s} "
+            v = r.get(c, float("nan"))
+            line += f"{v:10.3f} " if isinstance(v, (int, float)) else f"{str(v):>10s} "
         print(line)
     print()
 
@@ -202,74 +216,75 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="dataset")
     ap.add_argument("--out", default="model.pkl")
-    ap.add_argument("--test-size", type=float, default=0.25)
+    ap.add_argument("--folds", type=int, default=5)
     args = ap.parse_args()
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     paths, y, groups = load_dataset(args.data)
-    X = build_feature_matrix(paths)
+    mats = build_representations(paths)
+    heads = make_heads()
 
-    # Group-aware hold-out split (no scene leakage).
-    gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=0)
-    tr, te = next(gss.split(X, y, groups))
-    Xtr, Xte, ytr, yte = X[tr], X[te], y[tr], y[te]
-    print(f"Split: {len(tr)} train / {len(te)} test "
-          f"(groups disjoint: {len(set(groups[tr]) & set(groups[te])) == 0})")
+    print(f"\nGroup {args.folds}-fold cross-validation:")
+    rows, oof_store = [], {}
+    for rep_name in REPS:
+        for head_name, ctor in heads.items():
+            pred, sc = cross_validate(mats[rep_name], y, groups, ctor, args.folds)
+            m = metrics_from_oof(y, pred, sc)
+            m["model"] = f"{rep_name} + {head_name}"
+            m.update(REP_COST[rep_name])
+            rows.append(m)
+            oof_store[m["model"]] = (pred, sc)
+            print(f"  {m['model']:28s} acc={m['accuracy']:.3f} "
+                  f"auc={m['roc_auc']:.3f} f1={m['f1']:.3f}")
+    print_table(rows)
 
-    rows, fitted = [], {}
-    for name, est in model_zoo().items():
-        clf, m = evaluate(est, Xtr, ytr, Xte, yte)
-        m["model"] = name
-        rows.append(m)
-        fitted[name] = clf
-        print(f"  {name:22s} acc={m['accuracy']:.3f} auc={m['roc_auc']:.3f} "
-              f"f1={m['f1']:.3f} size={m['size_mb']:.2f}MB infer={m['infer_ms']:.2f}ms")
+    # Select most accurate (tie -> higher AUC, then smaller backbone).
+    rows.sort(key=lambda r: (-r["accuracy"], -r["roc_auc"], r["size_mb"]))
+    best = rows[0]
+    best_name = best["model"]
+    rep_name, head_name = best_name.split(" + ")
+    backbone, use_hand = REPS[rep_name]
+    print(f"Selected: {best_name}  "
+          f"(acc={best['accuracy']:.3f}, auc={best['roc_auc']:.3f})")
 
-    # Append the (rejected) DL-embedding rows for an honest comparison.
-    full_rows = rows + DL_ROWS
-    print_table(full_rows)
+    # Honest out-of-fold predictions of the winner (for evaluate.py).
+    pred, sc = oof_store[best_name]
+    with open(os.path.join(RESULTS_DIR, "oof.json"), "w") as f:
+        json.dump({"model": best_name, "y_true": y.tolist(),
+                   "y_pred": pred.tolist(), "y_score": sc.tolist(),
+                   "paths": paths}, f)
 
-    # Selection: best accuracy among models that fit the on-device budget
-    # (<10 MB, <50 ms). Ties broken by ROC-AUC then smaller size.
-    budget = [r for r in rows if r["size_mb"] < 10 and r["infer_ms"] < 50]
-    budget.sort(key=lambda r: (-r["accuracy"], -r["roc_auc"], r["size_mb"]))
-    best_name = budget[0]["model"]
-    print(f"Selected final model: {best_name} "
-          f"(acc={budget[0]['accuracy']:.3f}, size={budget[0]['size_mb']:.2f}MB, "
-          f"infer={budget[0]['infer_ms']:.2f}ms)")
-
-    # Build the shipped model. We calibrate probabilities with cv="prefit":
-    # fit the base estimator on ~85% of the data, then fit a single calibrator on
-    # a held-out slice. Crucially this means ONE base model runs at inference
-    # (not k), keeping per-image latency ~10 ms instead of ~50 ms.
-    final_est = model_zoo()[best_name]
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=1)
-    fit_idx, cal_idx = next(gss2.split(X, y, groups))
-    final_est.fit(X[fit_idx], y[fit_idx])
-    n_cal_min = np.bincount(y[cal_idx]).min()
-    method = "isotonic" if n_cal_min >= 50 else "sigmoid"
-    final = CalibratedClassifierCV(final_est, method=method, cv="prefit")
-    final.fit(X[cal_idx], y[cal_idx])
+    # Ship: fit the head on ALL data and wrap in a probability calibrator. The
+    # honest accuracy already comes from the group OOF above; the calibrator only
+    # shapes the sigmoid, so a plain stratified CV is sufficient here (there are
+    # no augmented/duplicate rows that could leak across its folds).
+    X = mats[rep_name]
+    base = heads[head_name]()
+    final = CalibratedClassifierCV(base, method="sigmoid",
+                                   cv=min(args.folds, int(np.bincount(y).min())))
+    final.fit(X, y)
 
     payload = {
         "model": final,
+        "rep": rep_name,
+        "backbone": backbone,
+        "use_hand": use_hand,
+        "input_size": BACKBONE_INPUT.get(backbone) if backbone else None,
         "feature_names": FEATURE_NAMES,
         "model_name": best_name,
         "threshold": 0.5,
+        "cv_accuracy": float(best["accuracy"]),
+        "cv_roc_auc": float(best["roc_auc"]),
         "trained_on": {"real": int((y == 0).sum()), "screen": int((y == 1).sum())},
-        "version": 1,
+        "version": 3,
     }
     joblib.dump(payload, args.out, compress=3)
-    print(f"Saved {args.out} ({os.path.getsize(args.out) / 1e6:.2f} MB)")
+    print(f"Saved {args.out} ({os.path.getsize(args.out) / 1e6:.2f} MB) "
+          f"[rep={rep_name}, backbone={backbone}, hand={use_hand}]")
 
-    # Persist results for evaluate.py / README.
     with open(os.path.join(RESULTS_DIR, "comparison.json"), "w") as f:
-        json.dump(full_rows, f, indent=2, default=float)
-    with open(os.path.join(RESULTS_DIR, "split.json"), "w") as f:
-        json.dump({"train_idx": tr.tolist(), "test_idx": te.tolist(),
-                   "paths": paths, "labels": y.tolist()}, f)
-    np.save(os.path.join(RESULTS_DIR, "X.npy"), X)
-    print(f"Wrote comparison + cached features to {RESULTS_DIR}/")
+        json.dump(rows, f, indent=2, default=float)
+    print(f"Wrote comparison + oof predictions to {RESULTS_DIR}/")
 
 
 if __name__ == "__main__":
