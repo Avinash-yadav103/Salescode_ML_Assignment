@@ -76,9 +76,9 @@ REP_COST = {
 }
 
 
-# --------------------------------------------------------------------------- #
+ 
 # Data loading
-# --------------------------------------------------------------------------- #
+ 
 def _list_images(folder):
     if not os.path.isdir(folder):
         return []
@@ -107,9 +107,9 @@ def load_dataset(data_dir):
     return paths, labels, groups
 
 
-# --------------------------------------------------------------------------- #
+ 
 # Representation building (hand features + CNN embeddings), disk-cached
-# --------------------------------------------------------------------------- #
+ 
 def _sig(paths):
     h = hashlib.md5()
     for p in paths:
@@ -150,9 +150,9 @@ def build_representations(paths):
     return mats
 
 
-# --------------------------------------------------------------------------- #
+ 
 # Heads + cross-validation
-# --------------------------------------------------------------------------- #
+ 
 def make_heads():
     return {
         "LogReg": lambda: make_pipeline(
@@ -209,9 +209,9 @@ def print_table(rows):
     print()
 
 
-# --------------------------------------------------------------------------- #
+ 
 # Main
-# --------------------------------------------------------------------------- #
+ 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="dataset")
